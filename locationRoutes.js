@@ -305,6 +305,25 @@ module.exports = function mountLocationRoutes(app, deps) {
         }
       }
 
+      // Close out fix-and-upload commands the device picked up (status UPLOADING)
+      // but never reports COMPLETED for — a successful batch from that device is
+      // the completion signal. Without this they hang at UPLOADING forever and
+      // the fleet map can't tell "working" from "phone can't get a fix".
+      if (acceptedPointIds.length > 0 || duplicatePointIds.length > 0) {
+        try {
+          await LocationCommand.updateMany(
+            {
+              deviceId: resolvedDeviceId,
+              type: { $in: ['location_upload', 'location_latest'] },
+              status: 'UPLOADING',
+            },
+            { $set: { status: 'COMPLETED' } }
+          );
+        } catch (cmdErr) {
+          console.error('Command completion (non-fatal):', cmdErr.message);
+        }
+      }
+
       res.json({ acceptedPointIds, duplicatePointIds, rejected, hasMore: false });
     } catch (err) {
       console.error('Location batch error:', err.message);
