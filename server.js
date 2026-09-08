@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const cors     = require('cors');
 const morgan   = require('morgan');
 require('dotenv').config();
+const crypto = require('crypto');
 
 const app         = express();
 const PORT        = process.env.PORT        || 3000;
@@ -108,6 +109,54 @@ const fcmTokenSchema = new mongoose.Schema({
 fcmTokenSchema.index({ deviceId: 1 }, { unique: true });
 
 const FcmToken = mongoose.model('FcmToken', fcmTokenSchema);
+
+// ─── Enrollment Schemas ────────────────────────────────────────
+
+const enrollmentCodeSchema = new mongoose.Schema({
+  code:         { type: String, required: true, unique: true },
+  companyId:    { type: String },
+  employeeId:   { type: String, required: true },
+  employeeName: { type: String, required: true },
+  role:         { type: String, enum: ['driver', 'employee'], required: true },
+  capabilities: {
+    callMonitoring:     { type: Boolean, default: false },
+    locationTracking:   { type: Boolean, default: false },
+    expenseManagement:  { type: Boolean, default: false },
+  },
+  vehicle:   { id: String, registration: String },
+  serverUrl: { type: String },
+  apiKey:    { type: String },
+  driverId:  { type: String },
+  usedAt:    { type: Date },
+  expiresAt: { type: Date },
+  revoked:   { type: Boolean, default: false },
+}, { timestamps: true });
+
+enrollmentCodeSchema.index({ code: 1 }, { unique: true });
+
+const EnrollmentCode = mongoose.model('EnrollmentCode', enrollmentCodeSchema);
+
+const deviceEnrollmentSchema = new mongoose.Schema({
+  deviceId:     { type: String, required: true },
+  employeeId:   { type: String },
+  employeeName: { type: String },
+  role:         { type: String },
+  capabilities: {
+    callMonitoring:    { type: Boolean, default: false },
+    locationTracking:  { type: Boolean, default: false },
+    expenseManagement: { type: Boolean, default: false },
+  },
+  vehicle:     { id: String, registration: String },
+  companyId:   { type: String },
+  driverId:    { type: String },
+  deviceToken: { type: String, required: true, unique: true },
+  revoked:     { type: Boolean, default: false },
+}, { timestamps: true });
+
+deviceEnrollmentSchema.index({ deviceToken: 1 }, { unique: true });
+deviceEnrollmentSchema.index({ deviceId: 1 });
+
+const DeviceEnrollment = mongoose.model('DeviceEnrollment', deviceEnrollmentSchema);
 
 // ─── MongoDB Serverless Connection ───────────────────────
 let isConnected;
@@ -375,6 +424,156 @@ app.get('/api/employees', authenticate, async (req, res) => {
   }
 });
 
+// Register location Mongo models early (DeviceLocationState) without mounting
+// routes yet — FCM helpers used by those routes are defined later in this file.
+require('./locationRoutes');
+
+// ─── Enrollment Routes ─────────────────────────────────────────
+
+// POST /api/enrollment/redeem — no auth, one-time code exchange
+app.post('/api/enrollment/redeem', async (req, res) => {
+  try {
+    const { code, deviceId } = req.body;
+    if (!code || !deviceId)
+      return res.status(400).json({ error: 'Missing required fields: code, deviceId' });
+
+    const enrollmentCode = await EnrollmentCode.findOne({ code });
+    if (!enrollmentCode)
+      return res.status(404).json({ error: 'Invalid enrollment code' });
+    if (enrollmentCode.revoked)
+      return res.status(410).json({ error: 'Enrollment code has been revoked' });
+    if (enrollmentCode.usedAt)
+      return res.status(410).json({ error: 'Enrollment code has already been used' });
+    if (enrollmentCode.expiresAt && enrollmentCode.expiresAt < new Date())
+      return res.status(410).json({ error: 'Enrollment code has expired' });
+
+    const deviceToken = crypto.randomBytes(32).toString('hex');
+
+    const enrollment = new DeviceEnrollment({
+      deviceId,
+      employeeId:   enrollmentCode.employeeId,
+      employeeName: enrollmentCode.employeeName,
+      role:         enrollmentCode.role,
+      capabilities: enrollmentCode.capabilities,
+      vehicle:      enrollmentCode.vehicle,
+      companyId:    enrollmentCode.companyId,
+      driverId:     enrollmentCode.driverId,
+      deviceToken,
+    });
+    await enrollment.save();
+
+    enrollmentCode.usedAt = new Date();
+    await enrollmentCode.save();
+
+    // Surface the device on fleet-map / route pickers immediately, even before
+    // the first GPS fix arrives.
+    if (enrollmentCode.capabilities?.locationTracking) {
+      try {
+        const DeviceLocationState = mongoose.models.DeviceLocationState;
+        if (DeviceLocationState) {
+          await DeviceLocationState.findOneAndUpdate(
+            { deviceId },
+            {
+              $set: {
+                deviceId,
+                companyId: enrollmentCode.companyId,
+                employeeId: enrollmentCode.employeeId,
+                employeeName: enrollmentCode.employeeName,
+                vehicle: enrollmentCode.vehicle,
+                driverId: enrollmentCode.driverId,
+                lastReceivedAt: new Date(),
+                trackingStatus: 'ENROLLED',
+              },
+            },
+            { upsert: true }
+          );
+        }
+      } catch (stateErr) {
+        console.error('DeviceLocationState seed (non-fatal):', stateErr.message);
+      }
+    }
+
+    console.log(`📱 Device enrolled: ${deviceId} (${enrollmentCode.employeeName})`);
+
+    // Never return a blank serverUrl — Android needs it for all later API calls.
+    const resolvedServerUrl =
+      enrollmentCode.serverUrl ||
+      process.env.SERVER_URL ||
+      process.env.BACKEND_URL ||
+      `${req.protocol}://${req.get('host')}` ||
+      '';
+
+    res.json({
+      employeeId:   enrollmentCode.employeeId,
+      employeeName: enrollmentCode.employeeName,
+      role:         enrollmentCode.role,
+      capabilities: enrollmentCode.capabilities,
+      vehicle:      enrollmentCode.vehicle || null,
+      deviceToken,
+      serverUrl:    String(resolvedServerUrl).replace(/\/$/, ''),
+      apiKey:       enrollmentCode.apiKey    || process.env.API_KEY    || '',
+      deviceId,
+      webBaseUrl:   process.env.NEXT_URL || '',
+    });
+  } catch (err) {
+    console.error('Enrollment redeem error:', err.message);
+    res.status(500).json({ error: 'Failed to redeem enrollment code' });
+  }
+});
+
+// POST /api/enrollment/codes — X-API-Key protected, creates a new one-time code
+app.post('/api/enrollment/codes', authenticate, async (req, res) => {
+  try {
+    const {
+      employeeName, role, capabilities, vehicle,
+      companyId, employeeId, driverId, expiresInHours,
+      serverUrl, apiKey,
+    } = req.body;
+
+    if (!employeeName || !role)
+      return res.status(400).json({ error: 'Missing required fields: employeeName, role' });
+    if (!['driver', 'employee'].includes(role))
+      return res.status(400).json({ error: 'role must be driver or employee' });
+
+    const code = crypto.randomBytes(16).toString('hex');
+
+    const expiresAt = expiresInHours
+      ? new Date(Date.now() + expiresInHours * 60 * 60 * 1000)
+      : undefined;
+
+    const enrollmentCode = new EnrollmentCode({
+      code,
+      employeeId:   employeeId   || code,
+      employeeName,
+      role,
+      capabilities: {
+        callMonitoring:    capabilities?.callMonitoring    ?? false,
+        locationTracking:  capabilities?.locationTracking  ?? false,
+        expenseManagement: capabilities?.expenseManagement ?? false,
+      },
+      vehicle:   vehicle   || undefined,
+      companyId: companyId || undefined,
+      driverId:  driverId  || undefined,
+      serverUrl: serverUrl || undefined,
+      apiKey:    apiKey    || undefined,
+      expiresAt,
+    });
+
+    await enrollmentCode.save();
+    console.log(`🔑 Enrollment code created for ${employeeName} (${role})`);
+
+    res.status(201).json({
+      code,
+      employeeName,
+      role,
+      expiresAt: expiresAt || null,
+    });
+  } catch (err) {
+    console.error('Create enrollment code error:', err.message);
+    res.status(500).json({ error: 'Failed to create enrollment code' });
+  }
+});
+
 // ─── FCM Token Registration ───────────────────────────────────
 app.post('/api/fcm-token', authenticate, async (req, res) => {
   try {
@@ -410,7 +609,7 @@ function loadFirebaseServiceAccount() {
   return JSON.parse(fs.readFileSync(saPath, 'utf8'));
 }
 
-async function sendFcmSyncNowToTokens(tokenDocs, projectId, accessToken) {
+async function sendFcmDataToTokens(tokenDocs, projectId, accessToken, dataPayload) {
   let sent = 0;
   const errors = [];
   for (const tokenDoc of tokenDocs) {
@@ -426,7 +625,7 @@ async function sendFcmSyncNowToTokens(tokenDocs, projectId, accessToken) {
           body: JSON.stringify({
             message: {
               token: tokenDoc.token,
-              data: { action: 'sync_now' },
+              data: dataPayload,
               android: {
                 priority: 'high',
                 ttl: '0s',
@@ -530,7 +729,7 @@ app.all('/api/fcm-wake', authenticate, async (req, res) => {
     const accessToken = accessTokenRes.token;
 
     const projectId = serviceAccount.project_id;
-    const { sent, errors } = await sendFcmSyncNowToTokens(tokens, projectId, accessToken);
+    const { sent, errors } = await sendFcmDataToTokens(tokens, projectId, accessToken, { action: 'sync_now' });
 
     res.json({
       success: true,
@@ -544,6 +743,28 @@ app.all('/api/fcm-wake', authenticate, async (req, res) => {
     console.error('FCM wake error:', err.message);
     res.status(500).json({ error: 'Failed to send FCM wake notifications' });
   }
+});
+
+// ─── Location Routes ──────────────────────────────────────────
+const mountLocationRoutes = require('./locationRoutes');
+mountLocationRoutes(app, {
+  FcmToken,
+  DeviceEnrollment,
+  loadFirebaseServiceAccount,
+  sendFcmDataToTokens,
+  authenticate,
+  GoogleAuth,
+});
+
+// ─── Android Caller Lookup Routes ──────────────────────────────
+const mountCallerLookupRoutes = require('./callerLookupRoutes');
+mountCallerLookupRoutes(app, {
+  FcmToken,
+  DeviceEnrollment,
+  loadFirebaseServiceAccount,
+  sendFcmDataToTokens,
+  authenticate,
+  GoogleAuth,
 });
 
 // ─── Export for Vercel ─────────────────────────────────────────
