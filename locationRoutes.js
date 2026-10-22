@@ -77,6 +77,35 @@ const deviceLocationStateSchema = new mongoose.Schema({
 
 const DeviceLocationState = mongoose.model('DeviceLocationState', deviceLocationStateSchema);
 
+/**
+ * Last line of defence on upload quality.
+ *
+ * The device filters fixes before it queues them, but an older build, a
+ * replayed queue or a third-party client can still post coordinates that are
+ * not a position at all. Anything stored here is drawn on the fleet map, so
+ * garbage is rejected at the door rather than filtered out on every read.
+ * Returns a reason string when the point must not be stored, else null.
+ */
+const MAX_STORED_ACCURACY_M = 100;
+
+function pointQualityReason(pt) {
+  const lat = Number(pt.latitude);
+  const lng = Number(pt.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return 'non-numeric coordinates';
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return 'coordinates out of range';
+  // Null Island: what a provider emits when it has nothing.
+  if (Math.abs(lat) < 1e-7 && Math.abs(lng) < 1e-7) return 'null-island';
+
+  if (pt.accuracyMeters != null) {
+    const acc = Number(pt.accuracyMeters);
+    if (!Number.isFinite(acc)) return 'non-numeric accuracy';
+    // <= 0 means the provider reported no accuracy — a wifi/cell guess.
+    if (acc <= 0) return 'missing accuracy';
+    if (acc > MAX_STORED_ACCURACY_M) return `accuracy ${Math.round(acc)}m exceeds ${MAX_STORED_ACCURACY_M}m`;
+  }
+  return null;
+}
+
 const locationCommandSchema = new mongoose.Schema({
   deviceId:  { type: String, required: true },
   type:      {
@@ -195,6 +224,11 @@ module.exports = function mountLocationRoutes(app, deps) {
       for (const pt of points) {
         if (!pt.pointId || pt.latitude == null || pt.longitude == null) {
           rejected.push({ pointId: pt.pointId || null, reason: 'missing required fields' });
+          continue;
+        }
+        const badQuality = pointQualityReason(pt);
+        if (badQuality) {
+          rejected.push({ pointId: pt.pointId, reason: badQuality });
           continue;
         }
         try {

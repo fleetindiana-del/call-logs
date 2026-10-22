@@ -4,6 +4,7 @@ const cors     = require('cors');
 const morgan   = require('morgan');
 require('dotenv').config();
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 
 const app         = express();
 const PORT        = process.env.PORT        || 3000;
@@ -73,6 +74,10 @@ const toggleLogSchema = new mongoose.Schema({
       'PERMISSION_RESTORED',
       'ADMIN_DISABLED',
       'ADMIN_ENABLED',
+      // Shift boundaries from the device's own Shift switch. Kept in step with
+      // web/src/models/ToggleLog.ts — either server may receive them.
+      'SHIFT_ON',
+      'SHIFT_OFF',
     ],
     required: true,
   },
@@ -122,6 +127,7 @@ const enrollmentCodeSchema = new mongoose.Schema({
     callMonitoring:     { type: Boolean, default: false },
     locationTracking:   { type: Boolean, default: false },
     expenseManagement:  { type: Boolean, default: false },
+    shifts:             { type: Boolean, default: false },
   },
   vehicle:   { id: String, registration: String },
   serverUrl: { type: String },
@@ -145,6 +151,7 @@ const deviceEnrollmentSchema = new mongoose.Schema({
     callMonitoring:    { type: Boolean, default: false },
     locationTracking:  { type: Boolean, default: false },
     expenseManagement: { type: Boolean, default: false },
+    shifts:            { type: Boolean, default: false },
   },
   vehicle:     { id: String, registration: String },
   companyId:   { type: String },
@@ -157,6 +164,50 @@ deviceEnrollmentSchema.index({ deviceToken: 1 }, { unique: true });
 deviceEnrollmentSchema.index({ deviceId: 1 });
 
 const DeviceEnrollment = mongoose.model('DeviceEnrollment', deviceEnrollmentSchema);
+
+// ─── Credential-login Schemas ──────────────────────────────────
+//
+// Read-only mirrors of the dashboard's Mongoose models (web/src/models), so the
+// device can log in with the same username/password the driver already uses.
+// `strict: false` keeps these from dropping fields the dashboard owns — this
+// process must never be the reason a User document loses data.
+
+const userSchema = new mongoose.Schema({
+  name:         { type: String },
+  email:        { type: String },
+  username:     { type: String },
+  passwordHash: { type: String },
+  role:         { type: String },
+  companyId:    { type: mongoose.Schema.Types.Mixed },
+  departmentId: { type: mongoose.Schema.Types.Mixed },
+  // Set per driver in the dashboard. Replaces the per-code capabilities that
+  // enrollment codes used to carry.
+  capabilities: {
+    callMonitoring:    { type: Boolean, default: false },
+    locationTracking:  { type: Boolean, default: false },
+    expenseManagement: { type: Boolean, default: false },
+    shifts:            { type: Boolean, default: false },
+  },
+}, { timestamps: true, strict: false });
+
+const User = mongoose.models.User || mongoose.model('User', userSchema);
+
+const driverSchema = new mongoose.Schema({
+  userId:    { type: mongoose.Schema.Types.Mixed },
+  companyId: { type: mongoose.Schema.Types.Mixed },
+  status:    { type: String },
+}, { timestamps: true, strict: false });
+
+const Driver = mongoose.models.Driver || mongoose.model('Driver', driverSchema);
+
+const vehicleLookupSchema = new mongoose.Schema({
+  companyId:        { type: mongoose.Schema.Types.Mixed },
+  registration:     { type: String },
+  status:           { type: String },
+  assignedDriverId: { type: mongoose.Schema.Types.Mixed },
+}, { timestamps: true, strict: false, collection: 'vehicles' });
+
+const Vehicle = mongoose.models.Vehicle || mongoose.model('Vehicle', vehicleLookupSchema);
 
 // ─── MongoDB Serverless Connection ───────────────────────
 let isConnected;
@@ -521,6 +572,212 @@ app.post('/api/enrollment/redeem', async (req, res) => {
   }
 });
 
+// POST /api/enrollment/login — no auth; driver's own username/password
+//
+// Why this exists alongside /redeem: an enrollment code is single-use, so every
+// re-enrollment (reinstall, factory reset, cleared app data, a wiped keystore)
+// needed an admin to mint a fresh code before the driver could get back to work.
+// Credentials are re-usable, so the driver recovers unaided — which is the whole
+// point of the change. /redeem is deliberately left in place for existing
+// devices and as a fallback.
+app.post('/api/enrollment/login', async (req, res) => {
+  try {
+    const { username, password, deviceId } = req.body || {};
+    if (!username || !password || !deviceId) {
+      return res.status(400).json({
+        error: 'Missing required fields: username, password, deviceId',
+      });
+    }
+
+    const identifier = String(username).trim();
+    // Drivers are given a username, but they habitually type their email — accept
+    // either rather than making that a support call. Case-insensitive on both:
+    // an exact-match lookup fails invisibly when the phone's keyboard
+    // auto-capitalises the first letter.
+    const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`^${escaped}$`, 'i');
+    const user = await User.findOne({
+      $or: [{ username: pattern }, { email: pattern }],
+    });
+
+    // Same response whether the user is absent or the password is wrong, so this
+    // endpoint cannot be used to enumerate who works here.
+    const invalid = () =>
+      res.status(401).json({ error: 'Incorrect username or password' });
+
+    if (!user || !user.passwordHash) return invalid();
+
+    const passwordOk = await bcrypt.compare(String(password), user.passwordHash);
+    if (!passwordOk) return invalid();
+
+    // Admin accounts are not device accounts. Letting one enrol would put a
+    // dashboard login onto a tracked handset.
+    const role = String(user.role || '').toLowerCase();
+    if (role !== 'driver' && role !== 'employee') {
+      return res.status(403).json({
+        error: 'This account cannot be used to set up a device',
+      });
+    }
+
+    const driver = await Driver.findOne({ userId: user._id });
+    if (driver && String(driver.status || 'active') === 'inactive') {
+      return res.status(403).json({ error: 'This driver account is inactive' });
+    }
+
+    // Capabilities now live on the user, set in the dashboard. Absent (older
+    // records created before this field existed) means nothing is enabled —
+    // failing closed, so a missing field can never silently switch tracking on.
+    const caps = user.capabilities || {};
+    const capabilities = {
+      callMonitoring:    Boolean(caps.callMonitoring),
+      locationTracking:  Boolean(caps.locationTracking),
+      expenseManagement: Boolean(caps.expenseManagement),
+      // Users saved before `shifts` existed: scheduled shifts rode on locationTracking.
+      shifts: caps.shifts === undefined || caps.shifts === null
+        ? Boolean(caps.locationTracking)
+        : Boolean(caps.shifts),
+    };
+
+    // Vehicle comes from the assignment the dashboard already maintains, so it
+    // stays correct when a driver changes vehicle without re-enrolling.
+    let vehicle = null;
+    if (driver) {
+      const assigned = await Vehicle.findOne({
+        assignedDriverId: driver._id,
+        status: { $ne: 'inactive' },
+      });
+      if (assigned) {
+        vehicle = {
+          id: String(assigned._id),
+          registration: assigned.registration || '',
+        };
+      }
+    }
+
+    const companyId = user.companyId || driver?.companyId || null;
+    const deviceToken = crypto.randomBytes(32).toString('hex');
+
+    // One enrollment row per device, updated in place. Creating a new row per
+    // login would leave a trail of live tokens for the same handset, every one
+    // of them still able to post location.
+    const enrollment = await DeviceEnrollment.findOneAndUpdate(
+      { deviceId },
+      {
+        $set: {
+          deviceId,
+          employeeId:   String(user._id),
+          employeeName: user.name || identifier,
+          role,
+          capabilities,
+          vehicle:      vehicle || undefined,
+          companyId:    companyId ? String(companyId) : undefined,
+          driverId:     driver ? String(driver._id) : undefined,
+          deviceToken,
+          revoked:      false,
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    if (capabilities.locationTracking) {
+      try {
+        const DeviceLocationState = mongoose.models.DeviceLocationState;
+        if (DeviceLocationState) {
+          await DeviceLocationState.findOneAndUpdate(
+            { deviceId },
+            {
+              $set: {
+                deviceId,
+                companyId,
+                employeeId: String(user._id),
+                employeeName: user.name || identifier,
+                vehicle: vehicle || undefined,
+                driverId: driver ? driver._id : undefined,
+                lastReceivedAt: new Date(),
+                trackingStatus: 'ENROLLED',
+              },
+            },
+            { upsert: true }
+          );
+        }
+      } catch (stateErr) {
+        console.error('DeviceLocationState seed (non-fatal):', stateErr.message);
+      }
+    }
+
+    console.log(`🔐 Device login: ${deviceId} (${user.name || identifier})`);
+
+    const resolvedServerUrl =
+      process.env.SERVER_URL ||
+      process.env.BACKEND_URL ||
+      `${req.protocol}://${req.get('host')}` ||
+      '';
+
+    res.json({
+      employeeId:   String(user._id),
+      employeeName: user.name || identifier,
+      role,
+      capabilities,
+      vehicle,
+      deviceToken,
+      serverUrl:    String(resolvedServerUrl).replace(/\/$/, ''),
+      apiKey:       process.env.API_KEY || '',
+      deviceId:     enrollment.deviceId,
+      webBaseUrl:   process.env.NEXT_URL || '',
+    });
+  } catch (err) {
+    console.error('Enrollment login error:', err.message);
+    res.status(500).json({ error: 'Failed to sign in' });
+  }
+});
+
+/** Current capabilities for a caps object; `shifts` falls back to locationTracking when never set. */
+function resolveCapabilities(caps) {
+  const c = caps || {};
+  const locationTracking = Boolean(c.locationTracking);
+  return {
+    callMonitoring:    Boolean(c.callMonitoring),
+    locationTracking,
+    expenseManagement: Boolean(c.expenseManagement),
+    shifts: c.shifts === undefined || c.shifts === null ? locationTracking : Boolean(c.shifts),
+  };
+}
+
+// GET /api/enrollment/capabilities — Bearer deviceToken.
+// The phone caches its access at sign-in; this lets it pick up changes made in
+// Device Enrollment (expenses, shifts, ...) without the driver signing in again.
+// The sign-in account is the authority when there is one (the enrollment Edit
+// screen keeps it in sync); code-only enrollments read their code.
+app.get('/api/enrollment/capabilities', async (req, res) => {
+  try {
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    if (!token) return res.status(401).json({ error: 'Missing device token' });
+
+    const enrollment = await DeviceEnrollment.findOne({ deviceToken: token });
+    if (!enrollment) return res.status(401).json({ error: 'Invalid device token' });
+    if (enrollment.revoked) return res.status(403).json({ error: 'This device has been revoked' });
+
+    let caps = null;
+    if (enrollment.driverId) {
+      const driver = await Driver.findById(enrollment.driverId);
+      const user = driver ? await User.findById(driver.userId) : null;
+      if (user) caps = user.capabilities;
+    }
+    if (!caps && enrollment.employeeId) {
+      const code = await EnrollmentCode.findOne({ employeeId: enrollment.employeeId }).sort({ createdAt: -1 });
+      if (code) caps = code.capabilities;
+    }
+
+    res.json({
+      capabilities: resolveCapabilities(caps || enrollment.capabilities),
+      webBaseUrl: process.env.NEXT_URL || '',
+    });
+  } catch (err) {
+    console.error('Enrollment capabilities error:', err.message);
+    res.status(500).json({ error: 'Failed to load capabilities' });
+  }
+});
+
 // POST /api/enrollment/codes — X-API-Key protected, creates a new one-time code
 app.post('/api/enrollment/codes', authenticate, async (req, res) => {
   try {
@@ -550,6 +807,7 @@ app.post('/api/enrollment/codes', authenticate, async (req, res) => {
         callMonitoring:    capabilities?.callMonitoring    ?? false,
         locationTracking:  capabilities?.locationTracking  ?? false,
         expenseManagement: capabilities?.expenseManagement ?? false,
+        shifts:            capabilities?.shifts ?? capabilities?.locationTracking ?? false,
       },
       vehicle:   vehicle   || undefined,
       companyId: companyId || undefined,
