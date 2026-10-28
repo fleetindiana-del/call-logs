@@ -778,6 +778,46 @@ app.get('/api/enrollment/capabilities', async (req, res) => {
   }
 });
 
+// GET /api/driver/wallet — Bearer deviceToken.
+// Balance allocated on the website for the driver this handset belongs to.
+// The dashboard links the device to that driver; this reads the same wallet.
+app.get('/api/driver/wallet', async (req, res) => {
+  try {
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    if (!token) return res.status(401).json({ error: 'Missing device token' });
+
+    const enrollment = await DeviceEnrollment.findOne({ deviceToken: token });
+    if (!enrollment) return res.status(401).json({ error: 'Invalid device token' });
+    if (enrollment.revoked) return res.status(403).json({ error: 'This device has been revoked' });
+
+    let driver = enrollment.driverId ? await Driver.findById(enrollment.driverId) : null;
+    if (!driver && enrollment.employeeId) {
+      const code = await EnrollmentCode.findOne({
+        revoked: { $ne: true },
+        $or: [{ employeeId: enrollment.employeeId }, { code: enrollment.employeeId }],
+      }).sort({ createdAt: -1 });
+      if (code?.driverId) {
+        driver = await Driver.findById(code.driverId);
+        if (driver) {
+          enrollment.driverId = String(driver._id);
+          await enrollment.save();
+        }
+      }
+    }
+    if (!driver) return res.status(404).json({ error: 'No wallet for this device' });
+
+    const balance = Math.round((Number(driver.walletBalance) || 0) * 100) / 100;
+    res.json({
+      walletBalance: balance,
+      name: enrollment.employeeName || '',
+      driverId: String(driver._id),
+    });
+  } catch (err) {
+    console.error('Driver wallet error:', err.message);
+    res.status(500).json({ error: 'Failed to load wallet' });
+  }
+});
+
 // POST /api/enrollment/codes — X-API-Key protected, creates a new one-time code
 app.post('/api/enrollment/codes', authenticate, async (req, res) => {
   try {
@@ -1006,17 +1046,6 @@ app.all('/api/fcm-wake', authenticate, async (req, res) => {
 // ─── Location Routes ──────────────────────────────────────────
 const mountLocationRoutes = require('./locationRoutes');
 mountLocationRoutes(app, {
-  FcmToken,
-  DeviceEnrollment,
-  loadFirebaseServiceAccount,
-  sendFcmDataToTokens,
-  authenticate,
-  GoogleAuth,
-});
-
-// ─── Android Caller Lookup Routes ──────────────────────────────
-const mountCallerLookupRoutes = require('./callerLookupRoutes');
-mountCallerLookupRoutes(app, {
   FcmToken,
   DeviceEnrollment,
   loadFirebaseServiceAccount,

@@ -273,15 +273,30 @@ module.exports = function mountLocationRoutes(app, deps) {
 
       // Update session aggregate fields (upsert so routes appear even if
       // the device never called /sessions/upsert).
-      if (sessionId && acceptedPointIds.length > 0) {
-        const acceptedPts = points.filter(p => acceptedPointIds.includes(p.pointId));
-        const times = acceptedPts
-          .map(p => p.recordedAt ? new Date(p.recordedAt) : null)
-          .filter(Boolean)
-          .sort((a, b) => a - b);
+      //
+      // Attribute every point to the session it was recorded in, not to the
+      // batch's top-level sessionId. The device fills that field from the first
+      // point of the pending queue, so a batch that straddles a duty change
+      // carries points from two sessions and used to credit all of them to the
+      // older one: the ended route grew a totalPoints and a lastPointAt it
+      // never recorded, and the live route reported zero points and a null time
+      // span while holding the entire trail.
+      const acceptedSet = new Set(acceptedPointIds);
+      const bySession = new Map();
+      for (const p of points) {
+        if (!acceptedSet.has(p.pointId)) continue;
+        const sid = p.sessionId || sessionId;
+        if (!sid) continue;
+        let bucket = bySession.get(sid);
+        if (!bucket) bySession.set(sid, (bucket = { count: 0, times: [] }));
+        bucket.count++;
+        if (p.recordedAt) bucket.times.push(new Date(p.recordedAt));
+      }
 
+      for (const [sid, bucket] of bySession) {
+        bucket.times.sort((a, b) => a - b);
         const sessionUpdate = {
-          $inc: { totalPoints: acceptedPointIds.length },
+          $inc: { totalPoints: bucket.count },
           $set: {
             lastUploadAt: new Date(),
             deviceId: resolvedDeviceId,
@@ -290,17 +305,17 @@ module.exports = function mountLocationRoutes(app, deps) {
             driverId: req.enrollment.driverId,
           },
           $setOnInsert: {
-            sessionId,
+            sessionId: sid,
             status: 'ACTIVE',
-            startedAt: times[0] || new Date(),
+            startedAt: bucket.times[0] || new Date(),
             vehicleId: req.enrollment.vehicle?.id,
           },
         };
-        if (times.length > 0) {
-          sessionUpdate.$min = { firstPointAt: times[0] };
-          sessionUpdate.$max = { lastPointAt: times[times.length - 1] };
+        if (bucket.times.length > 0) {
+          sessionUpdate.$min = { firstPointAt: bucket.times[0] };
+          sessionUpdate.$max = { lastPointAt: bucket.times[bucket.times.length - 1] };
         }
-        await LocationSession.updateOne({ sessionId }, sessionUpdate, { upsert: true });
+        await LocationSession.updateOne({ sessionId: sid }, sessionUpdate, { upsert: true });
       }
 
       // Update DeviceLocationState with the most-recent accepted point
@@ -313,28 +328,56 @@ module.exports = function mountLocationRoutes(app, deps) {
         }, null);
 
         if (latestPt) {
-          const stateSet = {
-            deviceId:          resolvedDeviceId,
-            latestCoordinates: { lat: latestPt.latitude, lng: latestPt.longitude },
-            lastReceivedAt:    new Date(),
-            lastUploadAt:      new Date(),
+          // Two separate writes, because these fields answer two questions and
+          // a batch of backlog answers only one of them.
+          //
+          // "When did we last hear from this phone" is true of any batch,
+          // however old its contents. "Where is this vehicle now" is only true
+          // of a fix newer than the one already stored. A phone that reconnects
+          // and flushes a queue uploads its oldest points last, so the
+          // unconditional $set let a days-old fix land on top of a current one
+          // and park the driver's pin at wherever they were when the backlog
+          // began — with a fresh heartbeat next to it, so the map read it as
+          // live.
+          const contactSet = {
+            deviceId:       resolvedDeviceId,
+            lastReceivedAt: new Date(),
+            lastUploadAt:   new Date(),
             // Always stamp enrollment identity so company-scoped fleet map sees the device.
-            companyId:         req.enrollment.companyId,
-            employeeId:        req.enrollment.employeeId,
-            employeeName:      req.enrollment.employeeName,
-            vehicle:           req.enrollment.vehicle,
-            driverId:          req.enrollment.driverId,
-            trackingStatus:    'TRACKING',
+            companyId:      req.enrollment.companyId,
+            employeeId:     req.enrollment.employeeId,
+            employeeName:   req.enrollment.employeeName,
+            vehicle:        req.enrollment.vehicle,
+            driverId:       req.enrollment.driverId,
+            trackingStatus: 'TRACKING',
           };
-          if (latestPt.accuracyMeters       != null) stateSet.latestAccuracy = latestPt.accuracyMeters;
-          if (latestPt.speedMetersPerSecond != null) stateSet.latestSpeed    = latestPt.speedMetersPerSecond;
-          if (latestPt.batteryPercent       != null) stateSet.batteryPercent = latestPt.batteryPercent;
-          stateSet.lastRecordedAt = latestPt.recordedAt ? new Date(latestPt.recordedAt) : new Date();
-
           await DeviceLocationState.findOneAndUpdate(
             { deviceId: resolvedDeviceId },
-            { $set: stateSet },
+            { $set: contactSet },
             { upsert: true }
+          );
+
+          const fixAt = latestPt.recordedAt ? new Date(latestPt.recordedAt) : new Date();
+          const positionSet = {
+            latestCoordinates: { lat: latestPt.latitude, lng: latestPt.longitude },
+            lastRecordedAt:    fixAt,
+          };
+          if (latestPt.accuracyMeters       != null) positionSet.latestAccuracy = latestPt.accuracyMeters;
+          if (latestPt.speedMetersPerSecond != null) positionSet.latestSpeed    = latestPt.speedMetersPerSecond;
+          if (latestPt.batteryPercent       != null) positionSet.batteryPercent = latestPt.batteryPercent;
+
+          // No upsert: the contact write above guarantees the document exists,
+          // and a filtered upsert would duplicate it whenever the guard fails.
+          await DeviceLocationState.updateOne(
+            {
+              deviceId: resolvedDeviceId,
+              $or: [
+                { lastRecordedAt: null },
+                { lastRecordedAt: { $exists: false } },
+                { lastRecordedAt: { $lt: fixAt } },
+              ],
+            },
+            { $set: positionSet }
           );
         }
       }
